@@ -14,6 +14,7 @@ def _cce_lse_forward_kernel(
     C,
     Bias,
     LSE,
+    MaxLogits, # New output tensor for max logits
     LA,
     Locks,
     Valids,
@@ -27,7 +28,7 @@ def _cce_lse_forward_kernel(
     stride_cv,
     stride_cd,
     stride_biasv,
-    stride_lse_b,
+    stride_lse_b, # Assuming MaxLogits will use the same stride logic
     stride_vb,
     num_locks,
     # Meta-parameters
@@ -93,25 +94,33 @@ def _cce_lse_forward_kernel(
         logits = tl_softcapping(logits, softcap)
 
     if HAS_LA:
-        this_avg_logit = tl.sum(logits, 0) / B
+        this_avg_logit = tl.sum(logits, 0) / B # Note: sum over B dim of logits block
         tl.atomic_add(LA + offs_v, this_avg_logit, mask=offs_v < V)
 
-    this_mx = tl.max(logits, axis=1)
-    e = tl.exp(logits - this_mx[:, None])
-    this_lse = this_mx + tl.log(tl.sum(e, axis=1))
+    this_mx = tl.max(logits, axis=1) # Shape: (BLOCK_B,) max logit in this vocab block for each token
+    e_exp = tl.exp(logits - this_mx[:, None]) # Renamed 'e' to 'e_exp' to avoid conflict
+    this_lse = this_mx + tl.log(tl.sum(e_exp, axis=1)) # Shape: (BLOCK_B,) LSE for this vocab block
 
-    offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
-    o_mask = offs_b < B
+    # Use original offs_b for output pointers, not the potentially modified one if HAS_VALIDS
+    output_offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
+    o_mask = output_offs_b < B
 
-    lse_ptrs = LSE + (stride_lse_b * offs_b)
+    lse_ptrs = LSE + (stride_lse_b * output_offs_b)
+    max_logits_ptrs = MaxLogits + (stride_lse_b * output_offs_b) # Using same stride as LSE
 
     this_locks = Locks + (pid_b // tl.cdiv(B, BLOCK_B * num_locks))
     while tl.atomic_cas(this_locks, 0, 1) == 1:
         pass
 
-    lse = tl.load(lse_ptrs, mask=o_mask, other=0.0, eviction_policy="evict_last")
-    lse = tl_logaddexp(lse, this_lse)
-    tl.store(lse_ptrs, lse, mask=o_mask, eviction_policy="evict_last")
+    # Update LSE
+    lse_val = tl.load(lse_ptrs, mask=o_mask, other=0.0, eviction_policy="evict_last") # other should be -inf for LSE accumulation start
+    lse_val = tl_logaddexp(lse_val, this_lse)
+    tl.store(lse_ptrs, lse_val, mask=o_mask, eviction_policy="evict_last")
+
+    # Update MaxLogits using atomic_max
+    # this_mx is float32, MaxLogits tensor is float32.
+    # atomic_max should be fine.
+    tl.atomic_max(max_logits_ptrs, this_mx, mask=o_mask)
 
     tl.debug_barrier()
     tl.atomic_xchg(this_locks, 0)
@@ -134,6 +143,7 @@ _cce_lse_forward_kernel = triton.heuristics(  # type: ignore
 _cce_lse_forward_kernel = cce_forward_autotune()(_cce_lse_forward_kernel)  # type: ignore
 
 
+# Update overloads and function signature
 @overload
 def cce_lse_forward_kernel(
     e: torch.Tensor,
@@ -142,7 +152,7 @@ def cce_lse_forward_kernel(
     valids: torch.Tensor | None = None,
     softcap: float | None = None,
     return_logit_avg: Literal[False] = False,
-) -> torch.Tensor: ...
+) -> tuple[torch.Tensor, torch.Tensor]: ... # Returns (LSE, MaxLogits)
 
 
 @overload
@@ -153,7 +163,7 @@ def cce_lse_forward_kernel(
     valids: torch.Tensor | None = None,
     softcap: float | None = None,
     return_logit_avg: Literal[True] = True,
-) -> tuple[torch.Tensor, torch.Tensor]: ...
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ... # Returns (LSE, MaxLogits, LA)
 
 
 @overload
@@ -164,7 +174,7 @@ def cce_lse_forward_kernel(
     valids: torch.Tensor | None = None,
     softcap: float | None = None,
     return_logit_avg: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor: ...
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def cce_lse_forward_kernel(
@@ -174,7 +184,7 @@ def cce_lse_forward_kernel(
     valids: torch.Tensor | None = None,
     softcap: float | None = None,
     return_logit_avg: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor]:
     # Check constraints.
     assert e.shape[1] == c.shape[1], "Incompatible dimensions"
     assert e.is_contiguous(), "Matrix A must be contiguous"
@@ -190,11 +200,14 @@ def cce_lse_forward_kernel(
 
     V, D = c.shape
     # Allocates output.
+    # LSE should be initialized to -inf for logaddexp accumulation
     lse = e.new_full((B,), -float("inf"), dtype=torch.float32)
+    # MaxLogits should also be initialized to -inf for max accumulation
+    max_logits = e.new_full((B,), -float("inf"), dtype=torch.float32)
     locks = e.new_full(
         (triton.cdiv(B, 128),),
         0,
-        dtype=torch.uint32,
+        dtype=torch.int32, # Triton docs suggest torch.int32 for locks
     )
 
     if return_logit_avg:
@@ -210,7 +223,8 @@ def cce_lse_forward_kernel(
         e,
         c,
         bias,
-        lse,  #
+        lse,
+        max_logits, # Pass the new tensor
         logit_avg,
         locks,
         valids,
@@ -224,7 +238,7 @@ def cce_lse_forward_kernel(
         c.stride(0),
         c.stride(1),  #
         1 if bias is None else bias.stride(0),
-        lse.stride(0),
+        lse.stride(0), # Assuming max_logits uses same stride logic
         1 if valids is None else valids.stride(0),
         num_locks=locks.size(0),
         B_BIN=b_bin_fn(B),
@@ -232,6 +246,6 @@ def cce_lse_forward_kernel(
 
     if return_logit_avg:
         assert logit_avg is not None
-        return lse, logit_avg
+        return lse, max_logits, logit_avg
     else:
-        return lse
+        return lse, max_logits
