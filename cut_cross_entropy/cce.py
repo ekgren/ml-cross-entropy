@@ -116,9 +116,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
 
             if params.valids is not None:
                 targets_for_vp = params.targets[params.valids + params.shift]
-                targets_for_vp = params.targets[params.valids + params.shift]
             else:
-                targets_for_vp = params.targets
                 targets_for_vp = params.targets
 
             vp_valids_mask = (targets_for_vp >= vp_opts.start) & (targets_for_vp < vp_opts.stop)
@@ -153,7 +151,6 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         )
 
         if params.vocab_parallel_options is not None:
-            # Reconstruct global_neg_dot based on the shape of lse (num_valid_tokens)
             global_neg_dot = neg_dot.new_zeros(lse.size())
             if vp_valids_indices.numel() > 0 and neg_dot.numel() > 0:
                  if global_neg_dot.numel() > 0 and vp_valids_indices.numel() > 0:
@@ -216,16 +213,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
                 num_items_in_mean = lse.numel()
                 grad_scale_for_kernel = (1.0 / num_items_in_mean) if num_items_in_mean > 0 else 0.0
             elif reduction == "sum":
-
-        if grad_out_loss.numel() == 1:
-            grad_d_out = grad_out_loss
-            if reduction == "mean":
-                num_items_in_mean = lse.numel()
-                grad_scale_for_kernel = (1.0 / num_items_in_mean) if num_items_in_mean > 0 else 0.0
-            elif reduction == "sum":
                 grad_scale_for_kernel = 1.0
-            else:
-                raise ValueError(f"Unexpected reduction '{reduction}' for scalar grad_out_loss.")
             else:
                 raise ValueError(f"Unexpected reduction '{reduction}' for scalar grad_out_loss.")
         elif reduction == "none":
@@ -233,11 +221,9 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             grad_scale_for_kernel = 1.0
         else:
             raise ValueError(f"Unknown reduction '{reduction}' or incompatible grad_out_loss shape.")
-            raise ValueError(f"Unknown reduction '{reduction}' or incompatible grad_out_loss shape.")
 
         if (vp_opts := params.vocab_parallel_options) is not None:
             is_my_target = (targets >= vp_opts.start) & (targets < vp_opts.stop)
-            targets_for_kernel = torch.where(
             targets_for_kernel = torch.where(
                 is_my_target,
                 targets - vp_opts.start,
@@ -248,7 +234,6 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
 
         de, dc, dbias = cce_backward_kernel(
             do=grad_d_out,
-            do=grad_d_out,
             e=e,
             c=c,
             bias=bias,
@@ -257,10 +242,8 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             softcap=params.softcap,
             filter_eps=params.filter_eps,
             targets=targets_for_kernel,
-            targets=targets_for_kernel,
             shift=params.shift,
             vocab_ordering=vocab_ordering,
-            grad_scale=grad_scale_for_kernel,
             grad_scale=grad_scale_for_kernel,
             accum_e_fp32=params.accum_e_fp32,
             accum_c_fp32=params.accum_c_fp32,
@@ -318,7 +301,6 @@ def cce_linear_cross_entropy(
     assert e.size()[0:-1] == targets.size()
     assert e.size(-1) == c.size(1)
     if not torch.cuda.is_bf16_supported():
-    if not torch.cuda.is_bf16_supported():
         raise RuntimeError(
             "Cut Cross Entropy requires an ampere GPU or newer. "
             "Consider using torch_compile_linear_cross_entropy for scenarios where one is not available."
@@ -337,22 +319,16 @@ def cce_linear_cross_entropy(
         flat_targets_for_params_aligned = padded_flat_targets[:-1]
     else:
         flat_targets_for_params_aligned = flat_targets_for_params
-        flat_targets_for_params_aligned = flat_targets_for_params
 
-    assert (flat_targets_for_params_aligned.data_ptr() % 16) == 0, \
-        f"flat_targets_for_params_aligned not 16-byte aligned: {flat_targets_for_params_aligned.data_ptr() % 16}"
     assert (flat_targets_for_params_aligned.data_ptr() % 16) == 0, \
         f"flat_targets_for_params_aligned not 16-byte aligned: {flat_targets_for_params_aligned.data_ptr() % 16}"
 
     cce_params = CCEParams(
         targets=flat_targets_for_params_aligned,
-        targets=flat_targets_for_params_aligned,
         valids=valids,
         softcap=softcap,
         reduction=reduction,
         filter_eps=_handle_eps(filter_eps, flat_e.dtype),
-        shift=shift,
-        batch_shape=batch_shape,
         shift=shift,
         batch_shape=batch_shape,
         accum_e_fp32=accum_e_fp32,
