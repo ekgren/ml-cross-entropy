@@ -18,7 +18,7 @@ if __name__ == '__main__': # Good practice to put test code in a main block
         print("Inputs created.")
 
         try:
-            loss, max_s = linear_cross_entropy(
+            loss, max_s, argmax_idx = linear_cross_entropy(
                 embeddings,
                 classifier_weights,
                 labels,
@@ -30,6 +30,7 @@ if __name__ == '__main__': # Good practice to put test code in a main block
             print("\n--- Results ---")
             print("Loss shape:", loss.shape)
             print("Max Softmax Values shape:", max_s.shape)
+            print("Argmax Indices shape:", argmax_idx.shape) # New
 
             # Effective sequence length after shift
             S_effective = S - 1 if S > 1 and 1 > 0 else S
@@ -39,6 +40,8 @@ if __name__ == '__main__': # Good practice to put test code in a main block
                 print(loss[0, :min(5, S_effective)])
                 print("\nMax Softmax (first sequence, first 5 effective tokens):")
                 print(max_s[0, :min(5, S_effective)])
+                print("\nArgmax Indices (first sequence, first 5 effective tokens):") # New
+                print(argmax_idx[0, :min(5, S_effective)]) # New
             else:
                 print("\nLoss or Max Softmax tensor is empty (e.g., due to shift and sequence length).")
 
